@@ -1,23 +1,21 @@
-"""Read-only options market data adapters (Yahoo Finance and Tradier sandbox).
+"""Read-only Yahoo and Tradier sandbox option-market adapters.
 
-Trade placement is intentionally absent. Missing executable-side bid/ask stays missing;
-never substitute lastPrice as if it were a live executable quote.
+All Tradier requests are GET-only, sandbox-only, with an explicit path allowlist.
+No fallback from unavailable bid/ask to last traded price.
 """
 from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any
-
 import pandas as pd
 import requests
 
 ET = ZoneInfo("America/New_York")
-FIELDS = ("contractSymbol", "strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility", "lastTradeDate")
-TRADIER_SANDBOX = "https://sandbox.tradier.com/v1"
-
+FIELDS = ("contractSymbol", "contractSize", "strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility", "delta", "lastTradeDate")
+BASE_URL = "https://sandbox.tradier.com/v1"
 
 class OptionsDataError(RuntimeError):
-    """Market-data lookup failed; no chain or quote should be inferred."""
+    pass
 
 
 def _clean_chain(df: pd.DataFrame) -> pd.DataFrame:
@@ -27,48 +25,42 @@ def _clean_chain(df: pd.DataFrame) -> pd.DataFrame:
     for col in FIELDS:
         if col not in f.columns:
             f[col] = pd.NA
-    for col in ("strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility"):
+    # Missing multiplier on standard yfinance chain is recorded as "REGULAR".
+    f["contractSize"] = f["contractSize"].fillna("REGULAR")
+    for col in ("strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility", "delta"):
         f[col] = pd.to_numeric(f[col], errors="coerce")
     return f.loc[:, FIELDS].sort_values("strike").reset_index(drop=True)
 
 
 def _tradier_get(path: str, token: str, params: dict[str, Any]) -> dict:
-    # Deliberate read-only allowlist. Never send order requests or use live API base URL.
     allowed = {"/markets/options/expirations", "/markets/options/chains", "/markets/quotes"}
     if path not in allowed:
-        raise OptionsDataError("Unsupported market-data endpoint")
+        raise OptionsDataError("Unsupported market-data path")
     if not token or not token.strip():
-        raise OptionsDataError("Tradier sandbox token is missing")
+        raise OptionsDataError("Tradier sandbox token not configured")
     try:
-        response = requests.get(
-            TRADIER_SANDBOX + path,
-            headers={"Authorization": f"Bearer {token.strip()}", "Accept": "application/json"},
-            params=params, timeout=12,
-        )
-        if response.status_code == 401:
-            raise OptionsDataError("Tradier rejected the sandbox token (401). Check that it is a sandbox token, not a production token.")
-        if response.status_code == 429:
-            raise OptionsDataError("Tradier rate limited the market-data lookup (429). Try again later.")
-        if response.status_code >= 400:
-            raise OptionsDataError(f"Tradier API returned HTTP {response.status_code}. Check API access/status.")
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise OptionsDataError("Tradier returned an unexpected response format.")
-        if payload.get("fault") or payload.get("errors"):
-            raise OptionsDataError("Tradier returned an API error for this lookup.")
+        r = requests.get(BASE_URL + path, headers={"Authorization": "Bearer " + token.strip(), "Accept": "application/json"}, params=params, timeout=15)
+        if r.status_code == 401:
+            raise OptionsDataError("Tradier sandbox rejected the token (401). Check your sandbox token, not a live token.")
+        if r.status_code == 429:
+            raise OptionsDataError("Tradier rate limit (429). Retry after a cooldown.")
+        if r.status_code >= 400:
+            raise OptionsDataError(f"Tradier returned HTTP {r.status_code}.")
+        payload = r.json()
+        if not isinstance(payload, dict) or payload.get("fault") or payload.get("errors"):
+            raise OptionsDataError("Tradier returned an unexpected error payload.")
         return payload
     except OptionsDataError:
         raise
     except (requests.exceptions.RequestException, ValueError) as exc:
-        raise OptionsDataError(f"Tradier connection/response failed ({type(exc).__name__}).") from exc
+        raise OptionsDataError(f"Tradier request failed ({type(exc).__name__}).") from exc
 
 
 def get_expirations(symbol: str, provider: str = "Yahoo Finance", token: str = "") -> tuple[str, ...]:
     if provider == "Tradier sandbox":
-        raw = _tradier_get("/markets/options/expirations", token, {"symbol": symbol, "includeAllRoots": "true"})
-        dates = (raw.get("expirations") or {}).get("date") if isinstance(raw.get("expirations"), dict) else None
-        if isinstance(dates, str):
-            dates = [dates]
+        data = _tradier_get("/markets/options/expirations", token, {"symbol": symbol, "includeAllRoots": "false"})
+        dates = (data.get("expirations") or {}).get("date") if isinstance(data.get("expirations"), dict) else None
+        dates = [dates] if isinstance(dates, str) else dates
         if not isinstance(dates, list):
             return ()
     else:
@@ -76,56 +68,52 @@ def get_expirations(symbol: str, provider: str = "Yahoo Finance", token: str = "
             import yfinance as yf
             dates = list(yf.Ticker(symbol).options)
         except Exception as exc:
-            raise OptionsDataError(f"Yahoo Finance options request failed ({type(exc).__name__}). This often happens because of provider throttling or data blocking on cloud-hosted apps.") from exc
+            raise OptionsDataError(f"Yahoo Finance options lookup failed ({type(exc).__name__}). Cloud-hosted requests are sometimes blocked or throttled.") from exc
+    from datetime import date
     today = datetime.now(ET).date()
-    output = []
-    for day in dates:
+    result = []
+    for item in dates:
         try:
-            from datetime import date
-            if date.fromisoformat(str(day)) >= today:
-                output.append(str(day))
+            val = str(item)
+            if date.fromisoformat(val) >= today:
+                result.append(val)
         except (ValueError, TypeError):
-            continue
-    return tuple(sorted(set(output)))
+            pass
+    return tuple(sorted(set(result)))
 
 
-def get_chain(symbol: str, expiration: str, provider: str = "Yahoo Finance", token: str = "") -> tuple[pd.DataFrame, pd.DataFrame]:
+def get_chain(symbol: str, expiry: str, provider: str = "Yahoo Finance", token: str = "") -> tuple[pd.DataFrame, pd.DataFrame]:
     if provider == "Tradier sandbox":
-        data = _tradier_get("/markets/options/chains", token, {"symbol": symbol, "expiration": expiration, "greeks": "false"})
+        data = _tradier_get("/markets/options/chains", token, {"symbol": symbol, "expiration": expiry, "greeks": "true"})
         options = data.get("options")
-        contracts = options.get("option") if isinstance(options, dict) else None
-        if isinstance(contracts, dict):
-            contracts = [contracts]
-        if not isinstance(contracts, list):
+        values = options.get("option") if isinstance(options, dict) else None
+        if isinstance(values, dict):
+            values = [values]
+        if not isinstance(values, list):
             return _clean_chain(pd.DataFrame()), _clean_chain(pd.DataFrame())
         rows = []
-        for option in contracts:
-            if not isinstance(option, dict):
+        for o in values:
+            if not isinstance(o, dict):
                 continue
-            greeks = option.get("greeks") or {}
-            if not isinstance(greeks, dict):
-                greeks = {}
+            greeks = o.get("greeks") if isinstance(o.get("greeks"), dict) else {}
             rows.append({
-                "optionType": str(option.get("option_type") or "").lower(),
-                "contractSymbol": option.get("symbol"),
-                "strike": option.get("strike"),
-                "bid": option.get("bid"),
-                "ask": option.get("ask"),
-                "lastPrice": option.get("last"),
-                "volume": option.get("volume"),
-                "openInterest": option.get("open_interest"),
-                "impliedVolatility": greeks.get("mid_iv"),
-                "lastTradeDate": option.get("trade_date"),
+                "optionType": str(o.get("option_type") or "").lower(),
+                "contractSymbol": o.get("symbol"),
+                "contractSize": o.get("contract_size", 100),
+                "strike": o.get("strike"), "bid": o.get("bid"), "ask": o.get("ask"),
+                "lastPrice": o.get("last"), "volume": o.get("volume"),
+                "openInterest": o.get("open_interest"), "delta": greeks.get("delta"),
+                "impliedVolatility": greeks.get("mid_iv"), "lastTradeDate": o.get("trade_date"),
             })
-        f = pd.DataFrame(rows)
-        if f.empty:
-            return _clean_chain(f), _clean_chain(f)
-        return (_clean_chain(f[f["optionType"] == "call"]),
-                _clean_chain(f[f["optionType"] == "put"]))
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return _clean_chain(frame), _clean_chain(frame)
+        return (_clean_chain(frame[frame["optionType"] == "call"]),
+                _clean_chain(frame[frame["optionType"] == "put"]))
     try:
         import yfinance as yf
-        obj = yf.Ticker(symbol).option_chain(expiration)
-        return _clean_chain(obj.calls), _clean_chain(obj.puts)
+        data = yf.Ticker(symbol).option_chain(expiry)
+        return _clean_chain(data.calls), _clean_chain(data.puts)
     except Exception as exc:
         raise OptionsDataError(f"Yahoo Finance option chain failed ({type(exc).__name__}).") from exc
 
@@ -141,18 +129,16 @@ def get_last_underlying_price(symbol: str, provider: str = "Yahoo Finance", toke
             return None
         for key in ("last", "close"):
             try:
-                value = float(quote.get(key))
-                if value > 0:
-                    return value
-            except (ValueError, TypeError):
+                p = float(quote.get(key))
+                if p > 0:
+                    return p
+            except (TypeError, ValueError):
                 pass
         return None
     try:
         import yfinance as yf
         d = yf.Ticker(symbol).history(period="5d", interval="1d", auto_adjust=True)
+        c = pd.to_numeric(d["Close"], errors="coerce").dropna() if d is not None and not d.empty else pd.Series(dtype=float)
+        return float(c.iloc[-1]) if not c.empty else None
     except Exception as exc:
-        raise OptionsDataError(f"Yahoo Finance stock quote failed ({type(exc).__name__}).") from exc
-    if d is None or d.empty:
-        return None
-    c = pd.to_numeric(d["Close"], errors="coerce").dropna()
-    return float(c.iloc[-1]) if not c.empty else None
+        raise OptionsDataError(f"Yahoo Finance underlying lookup failed ({type(exc).__name__}).") from exc

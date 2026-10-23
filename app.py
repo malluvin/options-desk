@@ -1,479 +1,391 @@
-"""Options Desk: mobile-friendly, read-only options analysis + local CSV paper journal."""
+"""Options Desk 2.0: scanner-first, read-only, mobile-friendly research app.
+
+There are NO trade placement APIs in this project. Scanner rankings only show
+alignment with explicitly published filters; they are not trade recommendations.
+"""
 from __future__ import annotations
 
-import math
-import re
 import hmac
-from datetime import datetime, date
+import re
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
-from option_data import OptionsDataError, get_chain, get_expirations, get_last_underlying_price
-from options_math import create_payoff, expiration_pnl, suggested_contracts
-from scanner import analyze_symbol, completed_daily_bars, market_regime
 from market_data import download_daily
+from option_data import OptionsDataError, get_chain, get_expirations, get_last_underlying_price
+from options_math import create_payoff, expiration_pnl
+from options_scanner import market_direction, directional_stock_signal, rank_contracts
+from scanner import completed_daily_bars
 
 ET = ZoneInfo("America/New_York")
-DEFAULT_SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "GOOGL", "TSLA",
-    "PLTR", "COIN", "MU", "AVGO", "CRM", "ADBE", "UBER", "QQQ", "SPY",
-]
-SCAN_SYMBOLS = [s for s in DEFAULT_SYMBOLS if s not in ("SPY", "QQQ")]
-STRATEGIES = ["Long call", "Long put", "Bull call debit spread", "Bear put debit spread"]
-JOURNAL_COLUMNS = [
-    "Logged ET", "Ticker", "Strategy", "Expiration", "Long strike", "Short strike",
-    "Contracts", "Premium per share", "Simulated cost ($)", "Max loss est. ($)",
-    "Max gain est. ($)", "Expiration breakeven", "Notes"
-]
+DEFAULT_WATCHLIST = (
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AMD", "TSLA",
+    "NFLX", "AVGO", "MU", "PLTR", "CRM", "ADBE", "UBER", "COIN",
+    "JPM", "GS", "V", "MA", "COST", "WMT", "LLY", "ISRG",
+)
+JOURNAL_COLS = ["Logged ET", "Ticker", "Contract", "Direction", "Entry premium", "Contracts", "Reason", "Outcome / exit notes"]
 
-st.set_page_config(page_title="Options Desk", page_icon="📊", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""<style>
-.block-container {padding-top: 1rem; padding-bottom: 3rem; max-width: 1160px}
-[data-testid="stMetric"] {background: rgba(115,158,170,.10); padding: 10px; border-radius: 12px}
-</style>""", unsafe_allow_html=True)
-st.title("📊 Options Desk")
-st.caption("Options strategy simulator · Stock-signal cross-check · Paper journal · No brokerage connection")
+st.set_page_config(page_title="Options Desk", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""
+<style>
+.block-container {max-width:1180px;padding-top:1.2rem;padding-bottom:3rem}
+[data-testid="stMetric"] {background:rgba(112,144,153,.11);border-radius:12px;padding:10px}
+@media (max-width:640px) {h1{font-size:2rem !important}.block-container{padding-left:.8rem;padding-right:.8rem}}
+</style>
+""", unsafe_allow_html=True)
 
-def configured_sandbox_token() -> str:
-    # Missing secrets file is normal for apps that use Yahoo Finance only.
+
+def _secret(name: str) -> str:
     try:
-        return str(st.secrets.get("TRADIER_SANDBOX_TOKEN", "")).strip()
+        return str(st.secrets.get(name, "")).strip()
     except (FileNotFoundError, KeyError, OSError):
         return ""
 
 
-def configured_access_passcode() -> str:
-    try:
-        return str(st.secrets.get("APP_PASSCODE", "")).strip()
-    except (FileNotFoundError, KeyError, OSError):
-        return ""
-
-
-access_passcode = configured_access_passcode()
-if access_passcode and not st.session_state.get("app_unlocked", False):
-    st.info("This Options Desk has a private access code. It does not connect to or place brokerage orders.")
-    with st.form("access_gate"):
-        supplied = st.text_input("Options Desk access code", type="password")
-        attempt = st.form_submit_button("Unlock Options Desk")
-    if attempt:
-        if hmac.compare_digest(supplied, access_passcode):
-            st.session_state.app_unlocked = True
+passcode = _secret("APP_PASSCODE")
+if passcode and not st.session_state.get("unlocked", False):
+    st.title("🔐 Options Desk")
+    st.caption("Private research dashboard · Manual trading only")
+    with st.form("unlock_form"):
+        attempt = st.text_input("Enter access code", type="password")
+        submit = st.form_submit_button("Unlock", use_container_width=True)
+    if submit:
+        if hmac.compare_digest(attempt, passcode):
+            st.session_state.unlocked = True
             st.rerun()
         else:
-            st.error("Incorrect access code.")
+            st.error("Incorrect access code")
     st.stop()
 
-sandbox_token = configured_sandbox_token()
-if sandbox_token and not access_passcode:
-    st.warning("Tradier token detected but disabled for safety: set APP_PASSCODE in Streamlit Secrets to protect the app, then restart it. Yahoo Finance / Manual simulator remain available.")
+st.title("📈 Options Desk")
+st.caption("Find call & put research candidates · Check costs and liquidity · Paper trade manually")
+
+sandbox_token = _secret("TRADIER_SANDBOX_TOKEN")
+if sandbox_token and not passcode:
+    st.warning("Tradier token is configured, but APP_PASSCODE is missing. Tradier is disabled to avoid exposing personal-use market data to visitors. Configure a passcode in Streamlit Secrets.")
     sandbox_token = ""
+provider = "Tradier sandbox" if sandbox_token else "Yahoo Finance"
 
 with st.sidebar:
-    if access_passcode and st.button("Lock this session"):
-        st.session_state.app_unlocked = False
-        st.rerun()
-    st.subheader("Market data")
-    if sandbox_token:
-        provider = st.radio("Options-chain provider", ["Tradier sandbox", "Yahoo Finance"], index=0)
-        st.caption("Tradier sandbox quotes are 15 minutes delayed; this app only makes read-only GET requests.")
+    st.subheader("Scanner controls")
+    watchlist_text = st.text_area("Stocks to monitor", ", ".join(DEFAULT_WATCHLIST), height=126)
+    direction_filter = st.selectbox("Show", ["Calls and puts", "Calls only", "Puts only"])
+    account_value = st.number_input("Paper account ($)", min_value=100.0, max_value=1_000_000.0, value=4000.0, step=250.0)
+    max_premium = st.number_input("Max loss on one contract ($)", min_value=5.0, max_value=float(account_value), value=min(200.0, float(account_value)), step=5.0)
+    st.caption(f"One long contract may lose its entire premium. Your limit is {max_premium/account_value*100:.1f}% of your paper account, before fees.")
+    dte_min, dte_max = st.slider("Days until expiration", min_value=7, max_value=120, value=(30, 60), step=1)
+    min_oi = st.select_slider("Min open interest", options=[0, 25, 50, 100, 250, 500], value=100)
+    min_vol = st.select_slider("Min session volume", options=[0, 5, 10, 25, 50, 100], value=10)
+    max_spread = st.slider("Max bid/ask spread (%)", min_value=3, max_value=35, value=15, step=1)
+    max_underlyings = st.slider("Max stock setups to check", 1, 10, 5)
+    st.divider()
+    st.caption(f"Options source: **{provider}**")
+    if provider == "Tradier sandbox":
+        st.caption("Sandbox quotes approximately 15 minutes delayed; Greeks can be updated less frequently. Personal-use connection only.")
     else:
-        provider = "Yahoo Finance"
-        st.caption("Yahoo Finance requires no token, but option chains can fail from cloud hosts. You can optionally connect Tradier sandbox in Streamlit secrets.")
-    st.divider()
-    st.subheader("Account settings")
-    account_value = st.number_input("Simulated account ($)", 100.0, 1000000.0, 4000.0, 250.0)
-    risk_pct = st.slider("Maximum modeled risk per position (%)", 0.1, 5.0, 0.5, 0.1)
-    cap_pct = st.slider("Maximum cash allocation (%)", 10, 100, 95, 5)
-    st.caption("These controls estimate affordable contracts. They do not provide trade recommendations.")
-    st.divider()
-    st.caption("Market data from a free public data source may be delayed, inaccurate, limited, or unavailable. No execution prices are guaranteed.")
+        st.caption("No token required, but Yahoo option-chain requests can fail from cloud hosting. Tradier sandbox recommended for a working options feed.")
+    if passcode and st.button("Lock dashboard", use_container_width=True):
+        st.session_state.unlocked = False
+        st.rerun()
 
-risk_cap = account_value * risk_pct / 100
-lab, sandbox, signals, journal, guide = st.tabs(["Options lab", "Manual simulator", "Stock signals", "Paper journal", "Guide & risks"])
+symbols = list(dict.fromkeys(x.strip().upper() for x in re.split(r"[,\s]+", watchlist_text) if x.strip()))
+symbols = [x for x in symbols if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", x)]
+symbols = [x for x in symbols if x not in ("SPY", "QQQ", "IWM")]
+symbols = symbols[:40]  # keep free-data requests reasonably bounded
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_expirations(symbol: str, provider: str, token: str):
-    return get_expirations(symbol, provider, token)
+def history_cached(symbols_to_scan: tuple[str, ...]):
+    return download_daily(symbols_to_scan)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def expirations_cached(symbol: str, src: str, token: str):
+    return get_expirations(symbol, src, token)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_chain(symbol: str, expiration: str, provider: str, token: str):
-    return get_chain(symbol, expiration, provider, token)
+def chain_cached(symbol: str, expiration: str, src: str, token: str):
+    return get_chain(symbol, expiration, src, token)
 
-@st.cache_data(ttl=180, show_spinner=False)
-def cached_underlying(symbol: str, provider: str, token: str):
-    return get_last_underlying_price(symbol, provider, token)
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_daily(symbols: tuple[str, ...]):
-    return download_daily(symbols)
+@st.cache_data(ttl=300, show_spinner=False)
+def underlying_cached(symbol: str, src: str, token: str):
+    return get_last_underlying_price(symbol, src, token)
 
 
-def is_number(x):
-    try:
-        return math.isfinite(float(x))
-    except (TypeError, ValueError):
-        return False
-
-
-def row_for_strike(frame: pd.DataFrame, strike: float) -> pd.Series:
-    return frame.loc[(frame["strike"] - strike).abs().idxmin()]
-
-
-def strikes_for(frame: pd.DataFrame) -> list[float]:
-    return sorted({float(x) for x in frame["strike"].dropna() if float(x) > 0})
-
-
-def strike_picker(label: str, available: list[float], target: float, key: str) -> float:
-    closest = min(range(len(available)), key=lambda i: abs(available[i] - target))
-    return st.selectbox(label, available, index=closest, format_func=lambda k: f"${k:g}", key=key)
-
-
-def quote_card(row: pd.Series, leg: str):
-    ask = row.get("ask")
-    bid = row.get("bid")
-    volume = row.get("volume")
-    oi = row.get("openInterest")
-    iv = row.get("impliedVolatility")
-    st.markdown(f"**{leg}: {row.get('contractSymbol', 'Option')}**")
-    p1, p2, p3 = st.columns(3)
-    p1.metric("Bid", f"${float(bid):.2f}" if is_number(bid) else "—")
-    p2.metric("Ask", f"${float(ask):.2f}" if is_number(ask) else "—")
-    p3.metric("Open interest", f"{int(oi):,}" if is_number(oi) else "—")
-    iv_text = f"{float(iv)*100:.1f}%" if is_number(iv) else "N/A"
-    vol_text = f"{int(volume):,}" if is_number(volume) else "N/A"
-    st.caption(f"Volume: {vol_text} · IV: {iv_text} · Last trade (not quote time): {row.get('lastTradeDate', 'Unknown')}")
-
-
-with lab:
-    st.subheader("Build a paper options trade")
-    st.caption("Choose an underlying, expiration, and strategy. Calculations below are modeled at expiration, not forecasts of the option's price before expiration.")
-    if provider == "Tradier sandbox":
-        st.info("Market data: Tradier paper-trading sandbox · 15-minute-delayed quotes · read-only · not for placing live trades.")
-    col_symbol, col_strategy = st.columns([1, 2])
-    with col_symbol:
-        ticker_raw = st.text_input("Stock / ETF ticker", value="AAPL", max_chars=10).strip().upper()
-    with col_strategy:
-        strategy = st.selectbox("Strategy", STRATEGIES, index=0)
-
-    ticker_valid = bool(re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker_raw))
-    if not ticker_valid:
-        st.error("Enter a valid stock ticker, such as AAPL, SPY, or MSFT.")
-    else:
+def find_expirations(values: tuple[str, ...], min_days: int, max_days: int, today: date) -> list[str]:
+    chosen = []
+    for expiry in values:
         try:
-            expiration_options = cached_expirations(ticker_raw, provider, sandbox_token if provider == "Tradier sandbox" else "")
-            # A stock quote failure should not prevent loading the expiration list.
-            try:
-                stock_price = cached_underlying(ticker_raw, provider, sandbox_token if provider == "Tradier sandbox" else "")
-            except OptionsDataError:
-                stock_price = None
-        except OptionsDataError as exc:
-            expiration_options = ()
-            stock_price = None
-            st.error(str(exc))
-        except Exception as exc:
-            expiration_options = ()
-            stock_price = None
-            st.error(f"Option expiration lookup failed ({type(exc).__name__}).")
-        if not expiration_options:
-            st.info("No listed option expirations were returned by the selected provider. This is not proof the symbol has no listed options.")
-            if provider == "Yahoo Finance":
-                st.warning("Yahoo Finance may be throttling cloud requests. The Manual simulator tab works offline. To use an alternative data source, configure a Tradier sandbox token in Streamlit app secrets and redeploy/reboot.")
-            st.markdown("**Provider status**: " + provider)
-            if st.button("Retry options-data lookup", use_container_width=True):
-                cached_expirations.clear()
-                cached_chain.clear()
-                cached_underlying.clear()
-                st.rerun()
-        else:
-            today_et = datetime.now(ET).date()
-            nearest_45 = min(range(len(expiration_options)), key=lambda i: abs((date.fromisoformat(expiration_options[i]) - today_et).days - 45))
-            expiry = st.selectbox("Option expiration", expiration_options, index=nearest_45)
-            days_to_expiry = max(0, (date.fromisoformat(expiry) - today_et).days)
-            q1, q2 = st.columns(2)
-            q1.metric("Underlying reference", f"${stock_price:,.2f}" if stock_price else "Unavailable")
-            q2.metric("Calendar days until expiry", days_to_expiry)
-
-            try:
-                calls, puts = cached_chain(ticker_raw, expiry, provider, sandbox_token if provider == "Tradier sandbox" else "")
-            except OptionsDataError as exc:
-                calls, puts = pd.DataFrame(), pd.DataFrame()
-                st.error(str(exc))
-            except Exception as exc:
-                calls, puts = pd.DataFrame(), pd.DataFrame()
-                st.error(f"Option-chain lookup failed ({type(exc).__name__}).")
-
-            is_call = strategy in ("Long call", "Bull call debit spread")
-            is_spread = strategy in ("Bull call debit spread", "Bear put debit spread")
-            chain = calls if is_call else puts
-            usable = chain.dropna(subset=["strike"]).copy() if not chain.empty else pd.DataFrame()
-            strikes = strikes_for(usable) if not usable.empty else []
-            if not strikes:
-                st.warning("No contracts for that expiration and strategy. Select another expiration or ticker.")
-            else:
-                st.markdown("#### Pick your strikes")
-                aim = stock_price if stock_price else float(strikes[len(strikes)//2])
-                long_strike = strike_picker("Buy (long) strike", strikes, aim, key=f"long_{ticker_raw}_{expiry}_{strategy}")
-                long_leg = row_for_strike(usable, long_strike)
-                short_leg = None
-                short_strike = None
-                valid_short = True
-                if is_spread:
-                    short_choices = [x for x in strikes if x > long_strike] if is_call else [x for x in strikes if x < long_strike]
-                    if short_choices:
-                        desired = long_strike + 5 if is_call else long_strike - 5
-                        short_strike = strike_picker("Sell (short) strike", short_choices, desired,
-                                                     key=f"short_{ticker_raw}_{expiry}_{strategy}_{long_strike}")
-                        short_leg = row_for_strike(usable, short_strike)
-                    else:
-                        valid_short = False
-                        st.warning("This long strike has no compatible short strike. Choose a different long strike.")
-
-                if valid_short:
-                    quote_card(long_leg, "Buy")
-                    if short_leg is not None:
-                        quote_card(short_leg, "Sell")
-                    st.markdown("#### Cost estimate")
-                    ask_long = float(long_leg["ask"]) if is_number(long_leg["ask"]) else None
-                    bid_short = float(short_leg["bid"]) if short_leg is not None and is_number(short_leg["bid"]) else None
-                    # Strict: non-zero executable side required. Never use lastPrice as a proxy.
-                    quote_ok = (ask_long is not None and ask_long > 0 and
-                                (not is_spread or (bid_short is not None and bid_short > 0)))
-                    indicative_debit = ask_long - (bid_short or 0) if quote_ok else None
-                    manual = st.checkbox("Use a hypothetical premium instead of provider bid/ask", value=not quote_ok)
-                    if manual:
-                        suggested_default = float(indicative_debit) if indicative_debit is not None and indicative_debit > 0 else 1.00
-                        per_share_debit = st.number_input("Hypothetical net debit per share ($)",
-                                                          min_value=0.01, value=round(suggested_default, 2), step=0.05)
-                        st.info("This is a manually entered hypothetical premium—not a market quote or evidence of an available fill.")
-                    elif quote_ok:
-                        per_share_debit = indicative_debit
-                        st.caption("Estimated debit uses the long leg's ASK minus the short leg's BID. Actual execution may differ, and even these quotes can be stale.")
-                    else:
-                        per_share_debit = None
-                        st.warning("Bid/ask data is missing or nonpositive. Enable the hypothetical-premium option to simulate a scenario.")
-
-                    model = None
-                    if per_share_debit is not None:
-                        try:
-                            model = create_payoff(strategy, float(long_strike), float(per_share_debit),
-                                                  float(short_strike) if short_strike is not None else None)
-                        except ValueError as exc:
-                            st.warning(f"Invalid modeled position: {exc}. Choose different strikes or premium.")
-                    if model is not None:
-                        max_allowed = suggested_contracts(model.max_loss, account_value, risk_pct, cap_pct)
-                        m1, m2, m3 = st.columns(3)
-                        m1.metric("Max modeled loss / contract", f"${model.max_loss:,.2f}")
-                        m2.metric("Max gain / contract", "Uncapped*" if model.max_gain is None else f"${model.max_gain:,.2f}")
-                        m3.metric("Expiration break-even", f"${model.breakeven:,.2f}")
-                        r1, r2 = st.columns(2)
-                        r1.metric("Risk budget", f"${risk_cap:,.2f}")
-                        r2.metric("Contracts within budget", max_allowed)
-                        if max_allowed == 0:
-                            st.warning("Even one standard contract/spread exceeds your selected modeled risk or allocation limit. Zero is the correct output under those settings.")
-                        if model.max_gain is None:
-                            st.caption("*A long call has theoretically unlimited upside, not a prediction of likely returns.")
-
-                        st.markdown("#### Expiration payoff (one contract / spread)")
-                        if stock_price is None:
-                            chart_center = float(long_strike)
-                        else:
-                            chart_center = float(stock_price)
-                        low = max(0.01, min(chart_center, float(long_strike),
-                                            float(short_strike) if short_strike is not None else chart_center) * 0.65)
-                        high = max(chart_center, float(long_strike),
-                                   float(short_strike) if short_strike is not None else chart_center) * 1.35
-                        outcomes = np.linspace(low, high, 101)
-                        df_payoff = pd.DataFrame({
-                            "Stock at expiration ($)": outcomes,
-                            "Net P/L ($)": [expiration_pnl(model, float(s)) for s in outcomes],
-                        }).set_index("Stock at expiration ($)")
-                        st.line_chart(df_payoff, y="Net P/L ($)", height=260)
-                        st.caption("At-expiration payoff, one standard 100-share contract or spread, excluding fees, slippage and assignment/exercise complications. Not a forecast of pre-expiration P/L.")
-
-                        st.markdown("#### Record a simulated paper trade")
-                        with st.form("log_trade", clear_on_submit=False):
-                            lots = st.number_input("Number of paper contracts", 1, 100, value=max(1, min(max_allowed, 1)), step=1)
-                            notes = st.text_input("Paper-trade thesis or notes (optional)", max_chars=280)
-                            submit = st.form_submit_button("Add to paper journal", use_container_width=True)
-                        if submit:
-                            if "journal_rows" not in st.session_state:
-                                st.session_state.journal_rows = []
-                            st.session_state.journal_rows.append({
-                                "Logged ET": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-                                "Ticker": ticker_raw,
-                                "Strategy": strategy,
-                                "Expiration": expiry,
-                                "Long strike": float(long_strike),
-                                "Short strike": float(short_strike) if short_strike is not None else "",
-                                "Contracts": int(lots),
-                                "Premium per share": round(float(per_share_debit), 4),
-                                "Simulated cost ($)": round(float(model.debit) * 100 * int(lots), 2),
-                                "Max loss est. ($)": round(float(model.max_loss) * int(lots), 2),
-                                "Max gain est. ($)": round(float(model.max_gain) * int(lots), 2) if model.max_gain is not None else "Unlimited theoretical",
-                                "Expiration breakeven": round(float(model.breakeven), 2),
-                                "Notes": notes,
-                            })
-                            if int(lots) > max_allowed:
-                                st.warning("Saved as a hypothetical paper trade, but this exceeds the risk budget you configured.")
-                            st.success("Added to this browser session's paper journal. Download its CSV to keep it after the session ends.")
-
-                with st.expander("View nearby option-chain quotes"):
-                    if stock_price:
-                        preview = usable.assign(distance=(usable["strike"] - stock_price).abs()).nsmallest(18, "distance").sort_values("strike")
-                    else:
-                        preview = usable.head(18)
-                    view_cols = ["strike", "bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility", "lastTradeDate"]
-                    st.dataframe(preview[view_cols], use_container_width=True, hide_index=True)
-            if st.button("Refresh option-chain data", use_container_width=True):
-                cached_chain.clear()
-                cached_expirations.clear()
-                cached_underlying.clear()
-                st.rerun()
+            dte = (date.fromisoformat(expiry) - today).days
+            if min_days <= dte <= max_days:
+                chosen.append(expiry)
+        except ValueError:
+            continue
+    chosen.sort(key=lambda v: abs((date.fromisoformat(v)-today).days-(min_days+max_days)/2))
+    return chosen[:2]  # limit requests for the first version
 
 
-with sandbox:
-    st.subheader("Manual options simulator — works without market data")
-    st.caption("Enter your own illustrative stock price, strikes, and premium. Every value here is hypothetical, not a live quote or a recommended trade.")
-    sim_ticker = st.text_input("Symbol for your journal", "DEMO", key="sim_ticker").strip().upper()
-    sim_strategy = st.selectbox("Options strategy", STRATEGIES, key="sim_strategy")
-    sim_expiry = st.date_input("Hypothetical expiration", value=date.today(), min_value=date.today(), key="sim_expiry")
-    sim_stock = st.number_input("Hypothetical stock price ($)", 0.01, 100000.0, 100.0, 1.0, key="sim_stock")
-    sim_long = st.number_input("Bought option strike ($)", 0.01, 100000.0, 100.0, 1.0, key="sim_long")
-    sim_spread = sim_strategy in ("Bull call debit spread", "Bear put debit spread")
-    sim_short = None
-    if sim_spread:
-        sim_short = st.number_input("Sold option strike ($)", 0.01, 100000.0,
-                                    105.0 if sim_strategy == "Bull call debit spread" else 95.0,
-                                    1.0, key=f"sim_short_{sim_strategy}")
-    sim_debit = st.number_input("Hypothetical net debit per share ($)", 0.01, 10000.0, 1.50, 0.05, key="sim_debit")
+def perform_scan() -> dict:
+    today_et = datetime.now(ET).date()
+    output = {"timestamp": datetime.now(ET).strftime("%b %d, %Y %I:%M %p ET"),
+              "provider": provider, "symbols_checked": len(symbols), "market": "Unavailable",
+              "signals": [], "contracts": [], "errors": [], "counts": {},
+              "underlyings_checked": 0, "expiries_checked": 0}
+    if not symbols:
+        output["errors"].append("Watchlist is empty; add stock symbols in the sidebar.")
+        return output
     try:
-        simulated = create_payoff(sim_strategy, sim_long, sim_debit, sim_short)
-    except ValueError as e:
-        st.warning(f"Fix the example: {e}")
-    else:
-        s1,s2,s3 = st.columns(3)
-        s1.metric("Max modeled loss / contract", f"${simulated.max_loss:,.2f}")
-        s2.metric("Max gain / contract", "Uncapped*" if simulated.max_gain is None else f"${simulated.max_gain:,.2f}")
-        s3.metric("Break-even at expiration", f"${simulated.breakeven:,.2f}")
-        allowed = suggested_contracts(simulated.max_loss, account_value, risk_pct, cap_pct)
-        st.caption(f"Under your ${risk_cap:,.2f} risk budget: **{allowed} contract(s)**. A paper scenario above that limit is for learning only.")
-        if allowed == 0:
-            st.warning("One standard contract/spread exceeds your configured loss or cash allocation limit.")
-        low = max(0.01, min(float(sim_stock), float(sim_long), float(sim_short) if sim_short else float(sim_long)) * 0.6)
-        high = max(float(sim_stock), float(sim_long), float(sim_short) if sim_short else float(sim_long)) * 1.4
-        prices = np.linspace(low, high, 101)
-        sim_curve = pd.DataFrame({"Stock at expiration ($)": prices,
-                                 "Net P/L ($)": [expiration_pnl(simulated, float(s)) for s in prices]}).set_index("Stock at expiration ($)")
-        st.line_chart(sim_curve, y="Net P/L ($)", height=260)
-        st.caption("Expiration only · one standard 100-share contract/spread · no assignment, fees or slippage modeled")
-        with st.form("manual_paper_form"):
-            sim_lots = st.number_input("Paper contracts", 1, 100, 1, 1)
-            sim_notes = st.text_input("Notes (optional)", max_chars=280, key="sim_notes")
-            add_sim = st.form_submit_button("Save hypothetical paper trade", use_container_width=True)
-        if add_sim:
-            if "journal_rows" not in st.session_state:
-                st.session_state.journal_rows = []
-            st.session_state.journal_rows.append({
-                "Logged ET": datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),
-                "Ticker": sim_ticker or "DEMO",
-                "Strategy": sim_strategy,
-                "Expiration": sim_expiry.isoformat(),
-                "Long strike": float(sim_long),
-                "Short strike": float(sim_short) if sim_short is not None else "",
-                "Contracts": int(sim_lots),
-                "Premium per share": round(float(sim_debit), 4),
-                "Simulated cost ($)": round(float(sim_debit) * 100 * int(sim_lots), 2),
-                "Max loss est. ($)": round(float(simulated.max_loss) * int(sim_lots), 2),
-                "Max gain est. ($)": round(float(simulated.max_gain) * int(sim_lots), 2) if simulated.max_gain is not None else "Unlimited theoretical",
-                "Expiration breakeven": round(float(simulated.breakeven), 2),
-                "Notes": "[MANUAL SCENARIO] " + sim_notes,
-            })
-            st.success("Hypothetical scenario saved in this session. Download the CSV in the Paper journal tab to keep it.")
-
-with signals:
-    st.subheader("Underlying stock setups")
-    st.caption("Reuses Swing Desk's completed-candle pullback/breakout scoring. Bullish stock setups are not proof that a call will be profitable. Puts are not rated by these bullish rules.")
-    raw_watch = st.text_area("Scan these symbols", ", ".join(SCAN_SYMBOLS), height=92)
-    watch = [s for s in dict.fromkeys(x.strip().upper() for x in raw_watch.replace("\n", ",").split(","))
-             if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s)]
-    if len(watch) > 50:
-        st.warning("For free data reliability, scanning is limited to the first 50 symbols.")
-        watch = watch[:50]
-    if st.button("Run daily stock scan", type="primary", use_container_width=True):
-        with st.spinner("Downloading completed daily bars and ranking setups…"):
+        data = history_cached(tuple(dict.fromkeys(symbols + ["SPY", "QQQ"])))
+    except Exception as exc:
+        output["errors"].append(f"Historical stock prices could not be downloaded ({type(exc).__name__}).")
+        return output
+    bars = {symbol: completed_daily_bars(data.get(symbol, pd.DataFrame()))
+            for symbol in (symbols + ["SPY", "QQQ"])}
+    output["market"] = market_direction(bars)
+    leads = []
+    for symbol in symbols:
+        try:
+            lead = directional_stock_signal(symbol, bars[symbol], output["market"])
+            if lead:
+                if (today_et - date.fromisoformat(lead["Signal session"])).days > 7:
+                    output["errors"].append(f"{symbol}: last completed daily bar is more than seven calendar days old. Skipping stale signal.")
+                    continue
+                if direction_filter == "Calls only" and lead["Direction"] != "CALL":
+                    continue
+                if direction_filter == "Puts only" and lead["Direction"] != "PUT":
+                    continue
+                leads.append(lead)
+        except Exception:
+            output["errors"].append(f"{symbol}: historical analysis failed.")
+    leads.sort(key=lambda x: -x["Stock score"])
+    output["signals"] = leads
+    for lead in leads[:max_underlyings]:
+        ticker = lead["Ticker"]
+        try:
+            exp = expirations_cached(ticker, provider, sandbox_token)
+            selected = find_expirations(exp, dte_min, dte_max, today_et)
+            if not selected:
+                output["errors"].append(f"{ticker}: no expirations in your {dte_min}–{dte_max} day range.")
+                continue
             try:
-                symbols = tuple(dict.fromkeys(watch + ["SPY", "QQQ"]))
-                raw = cached_daily(symbols)
-                completed = {s: completed_daily_bars(raw.get(s, pd.DataFrame())) for s in symbols}
-                favorable, regime_label = market_regime(completed)
-                result_rows = [analyze_symbol(s, completed.get(s, pd.DataFrame()), favorable,
-                                              account_value, risk_pct, cap_pct) for s in watch]
-                st.session_state.scan_output = (result_rows, regime_label)
-            except Exception:
-                st.error("Daily scan failed due to a network or market-data problem. Please try again later.")
-    if "scan_output" in st.session_state:
-        result_rows, regime_label = st.session_state.scan_output
-        frame = pd.DataFrame(result_rows)
-        if not frame.empty:
-            valid = frame[frame["Setup"].isin(["Potential pullback", "Potential breakout"])].copy()
-            st.markdown(f"**Market filter:** {regime_label} · **Scanned:** {len(frame)} · **Potential bullish setups:** {len(valid)}")
-            if valid.empty:
-                st.info("No qualifying bullish setup in this scan. That is a valid result.")
-            else:
-                st.dataframe(valid.sort_values(["Score", "Rel. volume"], ascending=False), use_container_width=True, hide_index=True)
-            with st.expander("All scan results"):
-                st.dataframe(frame, use_container_width=True, hide_index=True)
-            st.caption("Stock signals are independent of the options chain. Always check liquidity, time decay, volatility, and earnings before simulating an options position.")
-    if st.button("Clear daily scan cache"):
-        cached_daily.clear()
-        st.session_state.pop("scan_output", None)
-        st.rerun()
+                underlying = underlying_cached(ticker, provider, sandbox_token)
+            except OptionsDataError:
+                underlying = None
+            # If quote unavailable, use labeled last completed stock close only for proximity filters.
+            reference = float(underlying) if underlying else float(lead["Signal close"])
+            output["underlyings_checked"] += 1
+            for e in selected:
+                output["expiries_checked"] += 1
+                calls, puts = chain_cached(ticker, e, provider, sandbox_token)
+                selected_chain = calls if lead["Direction"] == "CALL" else puts
+                ranked, counts = rank_contracts(
+                    selected_chain, lead, e, reference, max_premium,
+                    min_oi, min_vol, max_spread, dte_min, dte_max, today_et,
+                )
+                for k, v in counts.items():
+                    output["counts"][k] = output["counts"].get(k, 0) + v
+                for contract in ranked:
+                    contract["Underlying quote type"] = "provider reference" if underlying else "last completed close"
+                output["contracts"].extend(ranked)
+        except OptionsDataError as exc:
+            output["errors"].append(f"{ticker}: {exc}")
+        except Exception as exc:
+            output["errors"].append(f"{ticker}: option lookup failed ({type(exc).__name__}).")
+    output["contracts"].sort(key=lambda x: (-x["Screen score"], x["Bid/ask spread %"], -x["Open interest"]))
+    # Keep a useful cross-stock shortlist instead of dozens of strikes in one name.
+    per_ticker = {}
+    shortlist = []
+    for item in output["contracts"]:
+        symbol = item["Ticker"]
+        if per_ticker.get(symbol, 0) >= 3:
+            continue
+        per_ticker[symbol] = per_ticker.get(symbol, 0) + 1
+        shortlist.append(item)
+    output["contracts"] = shortlist[:30]
+    return output
 
-with journal:
-    st.subheader("Paper-trade journal")
-    st.info("This journal exists only in your current Streamlit browser session. It is NOT a cloud database. Download your CSV before closing or resetting the app, then upload it on your next visit. On a public app, don't enter private account information.")
+
+main_tab, browse_tab, journal_tab, help_tab = st.tabs(["🔎 Ranked scanner", "🧮 Option calculator", "📝 Paper journal", "ℹ️ Setup & risks"])
+
+with main_tab:
+    st.subheader("Top screened call & put contracts")
+    st.caption("Screens the latest completed daily stock candles and then checks listed options for liquidity, expiration, and maximum premium. It does not predict which contracts will win.")
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        run = st.button("🔎 Scan for option candidates", type="primary", use_container_width=True)
+    with col_b:
+        if st.button("Clear cached market data", use_container_width=True):
+            history_cached.clear()
+            expirations_cached.clear()
+            chain_cached.clear()
+            underlying_cached.clear()
+            st.session_state.pop("scan_result", None)
+            st.session_state.pop("scan_key", None)
+            st.rerun()
+    key = (tuple(symbols), provider, direction_filter, max_premium, dte_min, dte_max,
+           min_oi, min_vol, max_spread, max_underlyings)
+    if run:
+        with st.spinner("Checking stock setups and option chains. Some data providers may block requests or return delayed quotes…"):
+            st.session_state.scan_result = perform_scan()
+            st.session_state.scan_key = key
+    if "scan_result" not in st.session_state:
+        st.info("Select your filters in the sidebar, then tap **Scan for option candidates**. Nothing is bought or sold.")
+    elif st.session_state.get("scan_key") != key:
+        st.warning("Your filters have changed. Run a new scan to update the results.")
+    else:
+        output = st.session_state.scan_result
+        metrics = st.columns(3)
+        metrics[0].metric("Stock setups", len(output["signals"]))
+        metrics[1].metric("Qualified contracts", len(output["contracts"]))
+        metrics[2].metric("Market trend", output["market"])
+        st.caption(f"Scanned {output['symbols_checked']} stocks · Checked {output['underlyings_checked']} optionable setups and {output['expiries_checked']} expiration chains · {output['timestamp']} · {output['provider']}")
+        if output["provider"] == "Tradier sandbox":
+            st.info("Tradier sandbox option quotes are delayed about 15 minutes. Greeks/IV may refresh less often; a data-fetch timestamp is not a quote timestamp.")
+        else:
+            st.info("Yahoo Finance chain data may be delayed or inaccessible from Streamlit Cloud. A missing chain is not evidence that the stock has no options.")
+        results = output["contracts"]
+        if results:
+            df = pd.DataFrame(results)
+            for i, row in enumerate(results, 1):
+                row["Rank"] = i
+            table = pd.DataFrame(results)[[
+                "Rank", "Ticker", "Direction", "Expiration", "Strike", "Ask", "Cost / max loss ($)",
+                "Screen score", "DTE", "Bid/ask spread %", "Open interest", "Volume", "Contract",
+            ]]
+            st.markdown("#### Contracts passing your filters")
+            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.download_button("Download screened contracts (CSV)", data=df.to_csv(index=False).encode(),
+                               file_name=f"options_screen_{datetime.now(ET).date()}.csv",
+                               mime="text/csv", use_container_width=True)
+            row_index = st.selectbox("Inspect a contract", range(len(results)),
+                                     format_func=lambda i: f"#{i+1} — {results[i]['Ticker']} {results[i]['Expiration']} ${results[i]['Strike']:.2f} {results[i]['Direction']} · ${results[i]['Cost / max loss ($)']:.0f} max premium")
+            chosen = results[row_index]
+            st.markdown("#### Selected contract")
+            top = st.columns(3)
+            top[0].metric("Ask (per share)", f"${chosen['Ask']:.2f}")
+            top[1].metric("One contract premium", f"${chosen['Cost / max loss ($)']:.2f}")
+            top[2].metric("Rule score", f"{chosen['Screen score']}/100")
+            st.write(f"**{chosen['Contract']}** · {chosen['Direction']} · {chosen['Expiration']} ({chosen['DTE']} DTE)")
+            st.write(f"**Why shown:** {chosen['Why it passed']}. Underlying stock setup score: {chosen['Stock score']}/100.")
+            st.write(f"**Expiry break-even:** ${chosen['Expiry break-even']:.2f} (plus fees). **Maximum modeled loss:** ${chosen['Cost / max loss ($)']:.2f} for one long standard contract, excluding fees.")
+            st.caption(f"Underlying price reference: ${chosen['Underlying reference']:.2f} ({chosen['Underlying quote type']}); stock signal session: {chosen['Signal session']}. Quotes may not be executable at displayed prices.")
+            if chosen["Delta"] is not None:
+                st.caption(f"Reported delta: {chosen['Delta']:+.2f} (may be stale). No earnings filter is currently applied; check earnings and news yourself.")
+        else:
+            if not output["signals"]:
+                st.info("No qualifying stock setups were detected. The scanner won't invent an options trade on a quiet day.")
+            elif output["errors"]:
+                st.warning("Stock setups were detected, but no contracts passed or market data could not be retrieved. Check provider messages and filters below.")
+            else:
+                st.info("No option contracts passed your liquidity, expiration, and premium filters. You can adjust your paper-trading budget or review rejected-contract reasons, but don't force an entry.")
+        with st.expander("Underlying stock setups"):
+            if output["signals"]:
+                st.dataframe(pd.DataFrame(output["signals"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No stock signals available.")
+        with st.expander("Why were contracts rejected?"):
+            if output["counts"]:
+                st.dataframe(pd.DataFrame([{"Reason": k.replace("_", " ").title(), "Contracts": v} for k,v in output["counts"].items()]), hide_index=True, use_container_width=True)
+            else:
+                st.caption("No option contracts were received for filtering.")
+        if output["errors"]:
+            with st.expander(f"Market-data notices ({len(output['errors'])})", expanded=not results):
+                for message in output["errors"][:30]:
+                    st.write("• " + message)
+    st.caption("Screen score measures rule alignment, NOT win probability or expected return. Long options can expire worthless; maximum premium can be lost. This app cannot place orders.")
+
+with browse_tab:
+    st.subheader("Manual option payoff calculator")
+    st.caption("Use this when market-data APIs are unavailable or when evaluating a quote from your paper brokerage. All prices are hypothetical unless you enter an actual quoted premium.")
+    col1, col2 = st.columns(2)
+    with col1:
+        strategy = st.selectbox("Strategy", ["Long call", "Long put", "Bull call debit spread", "Bear put debit spread"])
+        ticker = st.text_input("Underlying ticker", value="AAPL").strip().upper()
+        strike = st.number_input("Long strike ($)", min_value=0.01, value=200.0, step=1.0)
+    with col2:
+        premium = st.number_input("Premium / net debit per share ($)", min_value=0.01, value=2.0, step=.25)
+        contracts = st.number_input("Contracts", min_value=1, max_value=100, value=1)
+        other_strike = None
+        if "spread" in strategy.lower():
+            other_strike = st.number_input("Short strike ($)", min_value=0.01,
+                                            value=(strike+5 if strategy.startswith("Bull") else max(0.01, strike-5)), step=1.0)
+    try:
+        payoff = create_payoff(strategy, strike, premium, other_strike)
+        s1,s2,s3 = st.columns(3)
+        s1.metric("Modeled max loss", f"${payoff.max_loss*contracts:,.2f}")
+        s2.metric("Expiration break-even", f"${payoff.breakeven:,.2f}")
+        s3.metric("Max gain", "Not capped" if payoff.max_gain is None else f"${payoff.max_gain*contracts:,.2f}")
+        samples = [max(0, strike*(0.75 + .005*i)) for i in range(101)]
+        curve = pd.DataFrame({"Stock at expiration": samples,
+                              "Modeled P/L ($)": [expiration_pnl(payoff, p, int(contracts)) for p in samples]})
+        st.line_chart(curve, x="Stock at expiration", y="Modeled P/L ($)")
+        st.caption("This chart shows expiration payoff only, not price changes before expiration. Excludes commissions, slippage, assignment/exercise complications, and taxes.")
+    except ValueError as exc:
+        st.warning(str(exc))
+
+with journal_tab:
+    st.subheader("Paper-trading journal")
+    st.caption("Journal lives in your current browser session only. Download CSV before closing or clearing the session. On public apps, never enter personal account details.")
     if "journal_rows" not in st.session_state:
         st.session_state.journal_rows = []
-    file = st.file_uploader("Import a previously downloaded paper journal CSV", type=["csv"])
-    if file is not None and st.button("Import uploaded journal"):
+    imported = st.file_uploader("Import an earlier journal CSV", type="csv")
+    if imported is not None and st.button("Load imported journal"):
         try:
-            loaded = pd.read_csv(file).fillna("")
-            if not all(col in loaded.columns for col in JOURNAL_COLUMNS):
-                st.error("This file does not have all required Options Desk journal columns.")
-            elif len(loaded) > 10000:
-                st.error("Journal is too large for this starter app (10,000 rows maximum).")
+            frame = pd.read_csv(imported).fillna("")
+            if not all(col in frame.columns for col in JOURNAL_COLS):
+                st.error("CSV does not have the expected journal columns.")
             else:
-                st.session_state.journal_rows = loaded[JOURNAL_COLUMNS].to_dict("records")
-                st.success(f"Imported {len(loaded)} rows. Existing in-session entries were replaced.")
+                st.session_state.journal_rows = frame[JOURNAL_COLS].to_dict(orient="records")
+                st.success("Journal loaded into this session.")
         except Exception:
             st.error("Could not read that journal CSV.")
+    with st.form("paper_journal"):
+        j1,j2 = st.columns(2)
+        with j1:
+            journal_ticker = st.text_input("Stock symbol", value="AAPL")
+            contract_symbol = st.text_input("Option contract symbol (optional)")
+            journal_direction = st.selectbox("Position", ["Long call", "Long put", "Debit spread"])
+        with j2:
+            journal_premium = st.number_input("Paper entry premium/share", min_value=0.01, value=2.0, step=.25)
+            journal_contracts = st.number_input("Paper contracts", min_value=1, max_value=100, value=1)
+            journal_reason = st.text_input("Reason for the practice trade")
+        journal_notes = st.text_area("Exit/outcome notes (can fill in later when you export/edit)")
+        add = st.form_submit_button("Add paper-trade note", use_container_width=True)
+    if add:
+        st.session_state.journal_rows.append({
+            "Logged ET": datetime.now(ET).strftime("%Y-%m-%d %H:%M"),
+            "Ticker": journal_ticker.strip().upper(), "Contract": contract_symbol.strip().upper(),
+            "Direction": journal_direction, "Entry premium": float(journal_premium),
+            "Contracts": int(journal_contracts), "Reason": journal_reason, "Outcome / exit notes": journal_notes,
+        })
+        st.success("Added to this session's journal. Export to save it.")
     if st.session_state.journal_rows:
-        history = pd.DataFrame(st.session_state.journal_rows)
-        for col in JOURNAL_COLUMNS:
-            if col not in history:
-                history[col] = ""
-        st.dataframe(history[JOURNAL_COLUMNS], use_container_width=True, hide_index=True)
-        st.download_button("Download paper journal CSV", history[JOURNAL_COLUMNS].to_csv(index=False).encode("utf-8"),
-                           file_name="options_desk_paper_journal.csv", mime="text/csv", use_container_width=True)
-        st.caption("These are opening-plan snapshots, not marks-to-market or verified fills. P/L after an exit is not automatically tracked.")
-        if st.button("Clear journal from this session"):
+        journal_df = pd.DataFrame(st.session_state.journal_rows, columns=JOURNAL_COLS)
+        st.dataframe(journal_df, use_container_width=True, hide_index=True)
+        st.download_button("Save journal CSV", journal_df.to_csv(index=False).encode(), "options_paper_journal.csv", mime="text/csv", use_container_width=True)
+        if st.button("Clear session journal"):
             st.session_state.journal_rows = []
             st.rerun()
-    else:
-        st.caption("No paper trades logged in this browser session yet. Start in Options lab.")
 
-with guide:
-    st.subheader("How to use Options Desk")
+with help_tab:
+    st.subheader("What the scanner does")
     st.markdown("""
-1. **Start with a stock idea.** Run the Stock signals tab or enter a ticker directly in Options lab.
-2. **Choose a strategy.** Long calls and bull call debit spreads are bullish; long puts and bear put debit spreads are bearish.
-3. **Review expiration and the option chain.** An option can lose money even if the stock moves in the expected direction because of time decay, implied volatility changes, and/or paying too much premium.
-4. **Check strikes and liquidity.** Large bid/ask spreads, low open interest, stale quotes, and upcoming earnings all matter.
-5. **Check the real risk.** A standard equity option normally covers 100 shares. The app models the upfront net debit as the maximum expiration loss **while the selected spread remains intact**; short legs can be assigned and create unexpected stock positions.
-6. **Simulate manually.** Use the Manual simulator when the free provider is unavailable; add a paper trade to the journal and export the CSV to retain it.
+1. **Finds a bullish or bearish stock setup** from completed daily candles (moving averages, pullbacks and breakouts).
+2. **Looks up real listed contracts** in your options-market-data source for expirations in the selected range.
+3. **Rejects unsuitable contracts**: missing or crossed bid/ask, wide spreads, low volume/open interest, strikes very far from spot, nonstandard multipliers, or premium beyond your budget.
+4. **Ranks what remains** based on the underlying setup, liquidity, strike proximity/delta when available, time until expiration, and premium affordability.
+
+**What the score is not:** a probability of winning, a predicted return, an earnings forecast, or a recommendation to trade. It is a transparent rules-based filter. Every contract still needs review for earnings, news, IV, spreads, and current market conditions.
+
+**Buying options:** Long calls (bullish) and long puts (bearish) can lose **100% of the premium**. The calculator's maximum loss excludes fees. Contracts are usually for 100 shares, but adjusted contracts exist and are excluded by the scanner.
+
+**Selling options:** This version does **not** recommend selling to open uncovered options. You can sell to close a long option in your separate paper-trading platform. Defined-risk credit spreads may be a future addition after testing.
+
+**Data:** Yahoo Finance may refuse option chains from Streamlit Cloud. Tradier sandbox, if connected privately, provides delayed (about 15 minute) option quotes. Greeks can refresh hourly. The app makes read-only market-data requests and has no trading API calls.
 """)
-    st.warning("No order placement, no broker connection, no automatic monitoring, and no guaranteed live quotes. The chart displays terminal expiration P/L only, not mark-to-market before expiration. Exercise/assignment (particularly near expiration), transaction fees, and slippage are not modeled. Scores are not probabilities of profit. This is a learning tool, not personalized investment advice.")
-    st.markdown("**Options education:** [Options Industry Council](https://www.optionseducation.org/) · **Deployment:** [Streamlit Community Cloud](https://share.streamlit.io/)")
+    if not sandbox_token:
+        st.markdown("#### Connect Tradier for options contracts")
+        st.write("1. Obtain a **sandbox/paper** token from your personal Tradier account. 2. In Streamlit Community Cloud, open **Options Desk → ⋮ → Settings → Secrets**. 3. Paste the following, using your own confidential values:")
+        st.code('APP_PASSCODE = "YOUR_LONG_PRIVATE_PASSCODE"\nTRADIER_SANDBOX_TOKEN = "YOUR_SANDBOX_TOKEN"', language="toml")
+        st.write("4. Save secrets and reboot the app if requested. Never put these secrets into GitHub. Restrict access to yourself: Tradier describes API access as personal-use unless you are a partner. A passcode is only a basic gate, not full authentication.")
+    st.warning("Research and paper practice only. No automatic execution, no accurate guarantee of quote freshness or fills, and no earnings-event filter yet. Backtest with realistic costs and paper trade before using money.")
