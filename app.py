@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+import hmac
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
@@ -10,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from option_data import get_chain, get_expirations, get_last_underlying_price
+from option_data import OptionsDataError, get_chain, get_expirations, get_last_underlying_price
 from options_math import create_payoff, expiration_pnl, suggested_contracts
 from scanner import analyze_symbol, completed_daily_bars, market_regime
 from market_data import download_daily
@@ -36,7 +37,52 @@ st.markdown("""<style>
 st.title("📊 Options Desk")
 st.caption("Options strategy simulator · Stock-signal cross-check · Paper journal · No brokerage connection")
 
+def configured_sandbox_token() -> str:
+    # Missing secrets file is normal for apps that use Yahoo Finance only.
+    try:
+        return str(st.secrets.get("TRADIER_SANDBOX_TOKEN", "")).strip()
+    except (FileNotFoundError, KeyError, OSError):
+        return ""
+
+
+def configured_access_passcode() -> str:
+    try:
+        return str(st.secrets.get("APP_PASSCODE", "")).strip()
+    except (FileNotFoundError, KeyError, OSError):
+        return ""
+
+
+access_passcode = configured_access_passcode()
+if access_passcode and not st.session_state.get("app_unlocked", False):
+    st.info("This Options Desk has a private access code. It does not connect to or place brokerage orders.")
+    with st.form("access_gate"):
+        supplied = st.text_input("Options Desk access code", type="password")
+        attempt = st.form_submit_button("Unlock Options Desk")
+    if attempt:
+        if hmac.compare_digest(supplied, access_passcode):
+            st.session_state.app_unlocked = True
+            st.rerun()
+        else:
+            st.error("Incorrect access code.")
+    st.stop()
+
+sandbox_token = configured_sandbox_token()
+if sandbox_token and not access_passcode:
+    st.warning("Tradier token detected but disabled for safety: set APP_PASSCODE in Streamlit Secrets to protect the app, then restart it. Yahoo Finance / Manual simulator remain available.")
+    sandbox_token = ""
+
 with st.sidebar:
+    if access_passcode and st.button("Lock this session"):
+        st.session_state.app_unlocked = False
+        st.rerun()
+    st.subheader("Market data")
+    if sandbox_token:
+        provider = st.radio("Options-chain provider", ["Tradier sandbox", "Yahoo Finance"], index=0)
+        st.caption("Tradier sandbox quotes are 15 minutes delayed; this app only makes read-only GET requests.")
+    else:
+        provider = "Yahoo Finance"
+        st.caption("Yahoo Finance requires no token, but option chains can fail from cloud hosts. You can optionally connect Tradier sandbox in Streamlit secrets.")
+    st.divider()
     st.subheader("Account settings")
     account_value = st.number_input("Simulated account ($)", 100.0, 1000000.0, 4000.0, 250.0)
     risk_pct = st.slider("Maximum modeled risk per position (%)", 0.1, 5.0, 0.5, 0.1)
@@ -49,16 +95,16 @@ risk_cap = account_value * risk_pct / 100
 lab, sandbox, signals, journal, guide = st.tabs(["Options lab", "Manual simulator", "Stock signals", "Paper journal", "Guide & risks"])
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_expirations(symbol: str):
-    return get_expirations(symbol)
+def cached_expirations(symbol: str, provider: str, token: str):
+    return get_expirations(symbol, provider, token)
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_chain(symbol: str, expiration: str):
-    return get_chain(symbol, expiration)
+def cached_chain(symbol: str, expiration: str, provider: str, token: str):
+    return get_chain(symbol, expiration, provider, token)
 
 @st.cache_data(ttl=180, show_spinner=False)
-def cached_underlying(symbol: str):
-    return get_last_underlying_price(symbol)
+def cached_underlying(symbol: str, provider: str, token: str):
+    return get_last_underlying_price(symbol, provider, token)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_daily(symbols: tuple[str, ...]):
@@ -104,6 +150,8 @@ def quote_card(row: pd.Series, leg: str):
 with lab:
     st.subheader("Build a paper options trade")
     st.caption("Choose an underlying, expiration, and strategy. Calculations below are modeled at expiration, not forecasts of the option's price before expiration.")
+    if provider == "Tradier sandbox":
+        st.info("Market data: Tradier paper-trading sandbox · 15-minute-delayed quotes · read-only · not for placing live trades.")
     col_symbol, col_strategy = st.columns([1, 2])
     with col_symbol:
         ticker_raw = st.text_input("Stock / ETF ticker", value="AAPL", max_chars=10).strip().upper()
@@ -115,14 +163,30 @@ with lab:
         st.error("Enter a valid stock ticker, such as AAPL, SPY, or MSFT.")
     else:
         try:
-            expiration_options = cached_expirations(ticker_raw)
-            stock_price = cached_underlying(ticker_raw)
+            expiration_options = cached_expirations(ticker_raw, provider, sandbox_token if provider == "Tradier sandbox" else "")
+            # A stock quote failure should not prevent loading the expiration list.
+            try:
+                stock_price = cached_underlying(ticker_raw, provider, sandbox_token if provider == "Tradier sandbox" else "")
+            except OptionsDataError:
+                stock_price = None
+        except OptionsDataError as exc:
+            expiration_options = ()
+            stock_price = None
+            st.error(str(exc))
         except Exception as exc:
             expiration_options = ()
             stock_price = None
-            st.error("Could not retrieve the option list or underlying quote from the free provider. Try another ticker or refresh later.")
+            st.error(f"Option expiration lookup failed ({type(exc).__name__}).")
         if not expiration_options:
-            st.info("No listed option expirations were returned. Try another stock or check again later.")
+            st.info("No listed option expirations were returned by the selected provider. This is not proof the symbol has no listed options.")
+            if provider == "Yahoo Finance":
+                st.warning("Yahoo Finance may be throttling cloud requests. The Manual simulator tab works offline. To use an alternative data source, configure a Tradier sandbox token in Streamlit app secrets and redeploy/reboot.")
+            st.markdown("**Provider status**: " + provider)
+            if st.button("Retry options-data lookup", use_container_width=True):
+                cached_expirations.clear()
+                cached_chain.clear()
+                cached_underlying.clear()
+                st.rerun()
         else:
             today_et = datetime.now(ET).date()
             nearest_45 = min(range(len(expiration_options)), key=lambda i: abs((date.fromisoformat(expiration_options[i]) - today_et).days - 45))
@@ -133,10 +197,13 @@ with lab:
             q2.metric("Calendar days until expiry", days_to_expiry)
 
             try:
-                calls, puts = cached_chain(ticker_raw, expiry)
-            except Exception:
+                calls, puts = cached_chain(ticker_raw, expiry, provider, sandbox_token if provider == "Tradier sandbox" else "")
+            except OptionsDataError as exc:
                 calls, puts = pd.DataFrame(), pd.DataFrame()
-                st.error("Option-chain data couldn't be loaded. Yahoo Finance sometimes rate-limits or omits chains.")
+                st.error(str(exc))
+            except Exception as exc:
+                calls, puts = pd.DataFrame(), pd.DataFrame()
+                st.error(f"Option-chain lookup failed ({type(exc).__name__}).")
 
             is_call = strategy in ("Long call", "Bull call debit spread")
             is_spread = strategy in ("Bull call debit spread", "Bear put debit spread")
